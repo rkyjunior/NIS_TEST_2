@@ -1,13 +1,2222 @@
-{
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "type": "jdk",
-            "request": "launch",
-            "name": "Launch Java App"
+import { useState, useEffect, useMemo, useCallback } from "react";
+
+/* ============================================================
+   APARTMENT MANAGER
+   Single-operator property management system.
+   Storage: window.storage (persists across sessions), with an
+   in-memory fallback so the app still runs if storage is absent.
+   ============================================================ */
+
+const STORE_KEY = "apms-v1-data";
+
+/* ---------- utilities ---------- */
+const uid = () => Math.random().toString(36).slice(2, 10);
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const monthKey = (d) => (d || todayISO()).slice(0, 7);
+const monthLabel = (mk) => {
+  const [y, m] = mk.split("-");
+  return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString(undefined, { month: "short", year: "numeric" });
+};
+const addMonths = (iso, n) => {
+  const d = new Date(iso + "T00:00:00");
+  d.setMonth(d.getMonth() + n);
+  return d.toISOString().slice(0, 10);
+};
+const addDays = (iso, n) => {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const daysBetween = (a, b) =>
+  Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000);
+const num = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
+
+const CURRENCIES = [
+  { code: "GHS", symbol: "GH₵" },
+  { code: "NGN", symbol: "₦" },
+  { code: "KES", symbol: "KSh" },
+  { code: "ZAR", symbol: "R" },
+  { code: "USD", symbol: "$" },
+  { code: "EUR", symbol: "€" },
+  { code: "GBP", symbol: "£" },
+];
+
+const DEFAULTS = {
+  settings: {
+    businessName: "",
+    ownerName: "",
+    phone: "",
+    email: "",
+    address: "",
+    currency: "GHS",
+    vatEnabled: false,
+    vatRate: 15,
+    vatLabel: "VAT",
+    invoicePrefix: "INV",
+    quotePrefix: "QTE",
+    receiptPrefix: "RCT",
+    gracePeriodDays: 5,
+    passcode: "",
+    setupComplete: false,
+  },
+  properties: [],
+  units: [],
+  tenants: [],
+  leases: [],
+  invoices: [],
+  quotes: [],
+  payments: [],
+  expenses: [],
+  maintenance: [],
+  activity: [],
+  counters: { invoice: 1, quote: 1, receipt: 1 },
+};
+
+/* ---------- storage layer ---------- */
+let memoryStore = null;
+async function loadData() {
+  try {
+    const res = await window.storage.get(STORE_KEY, false);
+    if (res && res.value) return { ...DEFAULTS, ...JSON.parse(res.value) };
+  } catch (e) {
+    /* key absent or storage unavailable — fall through to defaults */
+  }
+  if (memoryStore) return memoryStore;
+  return JSON.parse(JSON.stringify(DEFAULTS));
+}
+async function saveData(data) {
+  memoryStore = data;
+  try {
+    await window.storage.set(STORE_KEY, JSON.stringify(data), false);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ---------- domain logic ---------- */
+const invoiceSubtotal = (inv) =>
+  (inv.items || []).reduce((s, i) => s + num(i.qty) * num(i.rate), 0);
+const invoiceTotals = (inv, settings) => {
+  const sub = invoiceSubtotal(inv);
+  const vat = inv.vatApplied ? (sub * num(settings.vatRate)) / 100 : 0;
+  return { sub, vat, total: sub + vat };
+};
+const paidOn = (invId, payments) =>
+  payments.filter((p) => p.invoiceId === invId).reduce((s, p) => s + num(p.amount), 0);
+
+const invoiceState = (inv, payments, settings) => {
+  if (inv.status === "draft") return "draft";
+  if (inv.status === "void") return "void";
+  const { total } = invoiceTotals(inv, settings);
+  const paid = paidOn(inv.id, payments);
+  if (paid >= total - 0.005 && total > 0) return "paid";
+  const overdue = daysBetween(inv.dueDate, todayISO()) > num(settings.gracePeriodDays);
+  if (overdue) return "overdue";
+  if (paid > 0) return "partial";
+  return "open";
+};
+
+const STATE_META = {
+  draft: { label: "Draft", tone: "grey" },
+  open: { label: "Open", tone: "blue" },
+  partial: { label: "Part paid", tone: "brass" },
+  paid: { label: "Paid", tone: "moss" },
+  overdue: { label: "Overdue", tone: "rust" },
+  void: { label: "Void", tone: "grey" },
+};
+
+/* ============================================================
+   ROOT
+   ============================================================ */
+export default function App() {
+  const [data, setData] = useState(null);
+  const [booted, setBooted] = useState(false);
+  const [unlocked, setUnlocked] = useState(false);
+  const [view, setView] = useState("dashboard");
+  const [toast, setToast] = useState(null);
+  const [navOpen, setNavOpen] = useState(false);
+
+  useEffect(() => {
+    loadData().then((d) => {
+      setData(d);
+      setBooted(true);
+    });
+  }, []);
+
+  const flash = useCallback((msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // Single write path. Every mutation goes through here, and every
+  // mutation writes an activity line — that's what makes the log honest.
+  const commit = useCallback(
+    (mutator, logMessage, logType = "update") => {
+      setData((prev) => {
+        const next = JSON.parse(JSON.stringify(prev));
+        mutator(next);
+        if (logMessage) {
+          next.activity.unshift({
+            id: uid(),
+            ts: new Date().toISOString(),
+            type: logType,
+            message: logMessage,
+          });
+          next.activity = next.activity.slice(0, 500);
         }
-    ]
+        saveData(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  if (!booted) return <Splash />;
+
+  const s = data.settings;
+  if (!s.setupComplete) return <Setup data={data} commit={commit} onDone={() => setUnlocked(true)} />;
+  if (!unlocked) return <Lock passcode={s.passcode} onUnlock={() => setUnlocked(true)} name={s.businessName} />;
+
+  const ctx = { data, commit, flash, setView };
+
+  const VIEWS = {
+    dashboard: Dashboard,
+    units: Units,
+    tenants: Tenants,
+    invoices: Invoices,
+    quotes: Quotes,
+    receipts: Receipts,
+    maintenance: Maintenance,
+    expenses: Expenses,
+    reports: Reports,
+    activity: Activity,
+    settings: Settings,
+  };
+  const Current = VIEWS[view] || Dashboard;
+
+  return (
+    <div className="app">
+      <Style />
+      <Sidebar view={view} setView={(v) => { setView(v); setNavOpen(false); }} settings={s} open={navOpen} />
+      {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
+      <main className="main">
+        <header className="topbar">
+          <button className="iconbtn only-mobile" onClick={() => setNavOpen(true)} aria-label="Open menu">☰</button>
+          <div>
+            <div className="eyebrow">{NAV.find((n) => n.id === view)?.section}</div>
+            <h1 className="page-title">{NAV.find((n) => n.id === view)?.label}</h1>
+          </div>
+          <button className="btn ghost" onClick={() => setUnlocked(false)}>Lock</button>
+        </header>
+        <div className="content">
+          <Current {...ctx} />
+        </div>
+      </main>
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+/* ============================================================
+   SHELL PIECES
+   ============================================================ */
+const NAV = [
+  { id: "dashboard", label: "Dashboard", section: "Overview", icon: "▤" },
+  { id: "units", label: "Properties & units", section: "Portfolio", icon: "▦" },
+  { id: "tenants", label: "Tenants & leases", section: "Portfolio", icon: "☖" },
+  { id: "invoices", label: "Invoices", section: "Money", icon: "▣" },
+  { id: "quotes", label: "Quotes", section: "Money", icon: "◫" },
+  { id: "receipts", label: "Receipts", section: "Money", icon: "▤" },
+  { id: "expenses", label: "Expenses", section: "Money", icon: "◧" },
+  { id: "maintenance", label: "Maintenance", section: "Operations", icon: "⚒" },
+  { id: "reports", label: "Reports", section: "Operations", icon: "◪" },
+  { id: "activity", label: "Activity log", section: "Operations", icon: "≡" },
+  { id: "settings", label: "Settings", section: "Operations", icon: "⚙" },
+];
+
+function Sidebar({ view, setView, settings, open }) {
+  const sections = ["Overview", "Portfolio", "Money", "Operations"];
+  return (
+    <aside className={"rail" + (open ? " open" : "")}>
+      <div className="brand">
+        <div className="brand-plate">AM</div>
+        <div>
+          <div className="brand-name">{settings.businessName || "Apartment Manager"}</div>
+          <div className="brand-sub">{settings.ownerName || "Manager"}</div>
+        </div>
+      </div>
+      <nav>
+        {sections.map((sec) => (
+          <div key={sec} className="navgroup">
+            <div className="navgroup-label">{sec}</div>
+            {NAV.filter((n) => n.section === sec).map((n) => (
+              <button
+                key={n.id}
+                className={"navitem" + (view === n.id ? " active" : "")}
+                onClick={() => setView(n.id)}
+              >
+                <span className="navicon">{n.icon}</span>
+                {n.label}
+              </button>
+            ))}
+          </div>
+        ))}
+      </nav>
+    </aside>
+  );
+}
+
+function Splash() {
+  return (
+    <div className="gate">
+      <Style />
+      <div className="gate-card"><div className="loading">Loading your records…</div></div>
+    </div>
+  );
+}
+
+/* ---------- first run ---------- */
+function Setup({ data, commit, onDone }) {
+  const [f, setF] = useState({
+    businessName: "",
+    ownerName: "",
+    phone: "",
+    currency: "GHS",
+    passcode: "",
+    confirm: "",
+  });
+  const [err, setErr] = useState("");
+
+  const submit = () => {
+    if (!f.businessName.trim()) return setErr("Give the business a name.");
+    if (f.passcode.length < 4) return setErr("Passcode must be at least 4 characters.");
+    if (f.passcode !== f.confirm) return setErr("The two passcodes don't match.");
+    commit((d) => {
+      d.settings = {
+        ...d.settings,
+        businessName: f.businessName.trim(),
+        ownerName: f.ownerName.trim(),
+        phone: f.phone.trim(),
+        currency: f.currency,
+        passcode: f.passcode,
+        setupComplete: true,
+      };
+    }, `Set up ${f.businessName.trim()}`, "system");
+    onDone();
+  };
+
+  return (
+    <div className="gate">
+      <Style />
+      <div className="gate-card wide">
+        <div className="gate-plate">AM</div>
+        <h2 className="gate-title">Set up your records</h2>
+        <p className="gate-sub">Four details now. Everything else is editable in Settings later.</p>
+        <Field label="Business name">
+          <input className="input" value={f.businessName} onChange={(e) => setF({ ...f, businessName: e.target.value })} placeholder="Kwesi Properties" />
+        </Field>
+        <div className="row2">
+          <Field label="Manager name">
+            <input className="input" value={f.ownerName} onChange={(e) => setF({ ...f, ownerName: e.target.value })} />
+          </Field>
+          <Field label="Phone">
+            <input className="input" value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} />
+          </Field>
+        </div>
+        <Field label="Currency">
+          <select className="input" value={f.currency} onChange={(e) => setF({ ...f, currency: e.target.value })}>
+            {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code} — {c.symbol}</option>)}
+          </select>
+        </Field>
+        <div className="row2">
+          <Field label="Create a passcode">
+            <input className="input" type="password" value={f.passcode} onChange={(e) => setF({ ...f, passcode: e.target.value })} />
+          </Field>
+          <Field label="Confirm passcode">
+            <input className="input" type="password" value={f.confirm} onChange={(e) => setF({ ...f, confirm: e.target.value })} />
+          </Field>
+        </div>
+        {err && <div className="err">{err}</div>}
+        <button className="btn primary block" onClick={submit}>Create records</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- lock screen ---------- */
+function Lock({ passcode, onUnlock, name }) {
+  const [v, setV] = useState("");
+  const [err, setErr] = useState("");
+  const go = () => (v === passcode ? onUnlock() : (setErr("Passcode not recognised."), setV("")));
+  return (
+    <div className="gate">
+      <Style />
+      <div className="gate-card">
+        <div className="gate-plate">AM</div>
+        <h2 className="gate-title">{name}</h2>
+        <p className="gate-sub">Enter your passcode to open the records.</p>
+        <input
+          className="input mono center"
+          type="password"
+          autoFocus
+          value={v}
+          onChange={(e) => { setV(e.target.value); setErr(""); }}
+          onKeyDown={(e) => e.key === "Enter" && go()}
+        />
+        {err && <div className="err">{err}</div>}
+        <button className="btn primary block" onClick={go}>Unlock</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   DASHBOARD — the unit board is the point
+   ============================================================ */
+function Dashboard({ data, commit, flash, setView }) {
+  const { units, leases, tenants, invoices, payments, expenses, maintenance, settings } = data;
+  const money = useMoney(settings);
+  const mk = monthKey();
+
+  const activeLeases = leases.filter((l) => l.status === "active");
+  const occupied = new Set(activeLeases.map((l) => l.unitId));
+
+  const billedThisMonth = invoices
+    .filter((i) => monthKey(i.issueDate) === mk && i.status !== "draft" && i.status !== "void")
+    .reduce((s, i) => s + invoiceTotals(i, settings).total, 0);
+  const collectedThisMonth = payments
+    .filter((p) => monthKey(p.date) === mk)
+    .reduce((s, p) => s + num(p.amount), 0);
+  const spentThisMonth = expenses
+    .filter((e) => monthKey(e.date) === mk)
+    .reduce((s, e) => s + num(e.amount), 0);
+  const outstanding = invoices.reduce((s, i) => {
+    const st = invoiceState(i, payments, settings);
+    if (st === "open" || st === "partial" || st === "overdue")
+      return s + (invoiceTotals(i, settings).total - paidOn(i.id, payments));
+    return s;
+  }, 0);
+
+  const expiring = activeLeases
+    .filter((l) => l.endDate && daysBetween(todayISO(), l.endDate) <= 60 && daysBetween(todayISO(), l.endDate) >= -3650)
+    .sort((a, b) => a.endDate.localeCompare(b.endDate));
+
+  const openJobs = maintenance.filter((m) => m.status !== "resolved");
+
+  // per-unit standing, drives the board colour
+  const unitStanding = (unitId) => {
+    const lease = activeLeases.find((l) => l.unitId === unitId);
+    if (!lease) return { key: "vacant", label: "Vacant", tenant: null, lease: null };
+    const t = tenants.find((x) => x.id === lease.tenantId);
+    const theirs = invoices.filter((i) => i.leaseId === lease.id);
+    const anyOverdue = theirs.some((i) => invoiceState(i, payments, settings) === "overdue");
+    const anyOpen = theirs.some((i) => ["open", "partial"].includes(invoiceState(i, payments, settings)));
+    return {
+      key: anyOverdue ? "overdue" : anyOpen ? "due" : "current",
+      label: anyOverdue ? "Overdue" : anyOpen ? "Rent due" : "Up to date",
+      tenant: t,
+      lease,
+    };
+  };
+
+  const generateRent = () => {
+    const due = activeLeases.filter((l) => {
+      const already = invoices.some((i) => i.leaseId === l.id && i.kind === "rent" && i.period === mk);
+      return !already;
+    });
+    if (!due.length) return flash("Rent invoices for this month already exist.");
+    commit((d) => {
+      due.forEach((l) => {
+        const unit = d.units.find((u) => u.id === l.unitId);
+        const n = d.counters.invoice++;
+        d.invoices.unshift({
+          id: uid(),
+          number: `${d.settings.invoicePrefix}-${String(n).padStart(4, "0")}`,
+          kind: "rent",
+          period: mk,
+          leaseId: l.id,
+          tenantId: l.tenantId,
+          unitId: l.unitId,
+          issueDate: todayISO(),
+          dueDate: addDays(todayISO(), 7),
+          items: [{ desc: `Rent — Unit ${unit ? unit.number : "?"} — ${monthLabel(mk)}`, qty: 1, rate: num(l.rent) }],
+          vatApplied: false,
+          status: "sent",
+          notes: "",
+        });
+      });
+    }, `Generated ${due.length} rent invoice${due.length > 1 ? "s" : ""} for ${monthLabel(mk)}`, "create");
+    flash(`${due.length} rent invoice${due.length > 1 ? "s" : ""} created.`);
+  };
+
+  const groups = data.properties.map((p) => ({
+    property: p,
+    units: units.filter((u) => u.propertyId === p.id),
+  }));
+
+  return (
+    <>
+      <div className="statrow">
+        <Stat label="Occupancy" value={units.length ? `${Math.round((occupied.size / units.length) * 100)}%` : "—"} sub={`${occupied.size} of ${units.length} units let`} />
+        <Stat label={`Billed · ${monthLabel(mk)}`} value={money(billedThisMonth)} sub="Invoices issued this month" />
+        <Stat label={`Collected · ${monthLabel(mk)}`} value={money(collectedThisMonth)} sub={`Expenses ${money(spentThisMonth)}`} tone="moss" />
+        <Stat label="Outstanding" value={money(outstanding)} sub="Across all unpaid invoices" tone={outstanding > 0 ? "rust" : "grey"} />
+      </div>
+
+      <div className="section-head">
+        <div>
+          <h2 className="h2">The board</h2>
+          <p className="sub">Every unit you manage, and where it stands right now. Click a unit to open it.</p>
+        </div>
+        <button className="btn primary" onClick={generateRent}>Generate {monthLabel(mk)} rent</button>
+      </div>
+
+      <div className="legend">
+        <span><i className="pip moss" /> Up to date</span>
+        <span><i className="pip brass" /> Rent due</span>
+        <span><i className="pip rust" /> Overdue</span>
+        <span><i className="pip grey" /> Vacant</span>
+      </div>
+
+      {!units.length && (
+        <Empty
+          title="No units yet"
+          body="Add a property and its units, and the board fills itself in."
+          action={<button className="btn primary" onClick={() => setView("units")}>Add a property</button>}
+        />
+      )}
+
+      {groups.map(({ property, units: us }) => (
+        <div key={property.id} className="board-group">
+          <div className="board-title">
+            <span>{property.name}</span>
+            <span className="board-meta">{property.address}</span>
+          </div>
+          <div className="board">
+            {us.map((u) => {
+              const st = unitStanding(u.id);
+              return (
+                <button key={u.id} className={"door " + st.key} onClick={() => setView("units")}>
+                  <span className="door-edge" />
+                  <span className="door-no">{u.number}</span>
+                  <span className="door-tenant">{st.tenant ? st.tenant.name : "Vacant"}</span>
+                  <span className="door-foot">
+                    <span className="door-rent">{money(u.rent)}</span>
+                    <span className="door-state">{st.label}</span>
+                  </span>
+                </button>
+              );
+            })}
+            {!us.length && <div className="door empty-door">No units on this property</div>}
+          </div>
+        </div>
+      ))}
+
+      <div className="split">
+        <Card title="Leases ending soon" sub="Next 60 days">
+          {expiring.length ? (
+            <ul className="list">
+              {expiring.map((l) => {
+                const u = units.find((x) => x.id === l.unitId);
+                const t = tenants.find((x) => x.id === l.tenantId);
+                const d = daysBetween(todayISO(), l.endDate);
+                return (
+                  <li key={l.id}>
+                    <span><strong>{t ? t.name : "—"}</strong> · Unit {u ? u.number : "—"}</span>
+                    <span className={"chip " + (d < 0 ? "rust" : d <= 30 ? "brass" : "grey")}>
+                      {d < 0 ? `${Math.abs(d)}d expired` : `${d}d left`}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : <div className="quiet">Nothing expiring in the next 60 days.</div>}
+        </Card>
+
+        <Card title="Open maintenance" sub={`${openJobs.length} job${openJobs.length === 1 ? "" : "s"}`}>
+          {openJobs.length ? (
+            <ul className="list">
+              {openJobs.slice(0, 6).map((m) => {
+                const u = units.find((x) => x.id === m.unitId);
+                return (
+                  <li key={m.id}>
+                    <span><strong>{m.title}</strong> · Unit {u ? u.number : "—"}</span>
+                    <span className={"chip " + (m.priority === "urgent" ? "rust" : m.priority === "high" ? "brass" : "grey")}>{m.priority}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : <div className="quiet">No open jobs. Quiet week.</div>}
+        </Card>
+      </div>
+    </>
+  );
+}
+
+/* ============================================================
+   PROPERTIES & UNITS
+   ============================================================ */
+function Units({ data, commit, flash }) {
+  const { properties, units, leases, tenants, settings } = data;
+  const money = useMoney(settings);
+  const [propModal, setPropModal] = useState(null);
+  const [unitModal, setUnitModal] = useState(null);
+
+  const saveProp = (f) => {
+    commit((d) => {
+      if (f.id) {
+        const p = d.properties.find((x) => x.id === f.id);
+        Object.assign(p, f);
+      } else {
+        d.properties.push({ ...f, id: uid() });
+      }
+    }, `${f.id ? "Updated" : "Added"} property ${f.name}`, f.id ? "update" : "create");
+    setPropModal(null);
+    flash("Property saved.");
+  };
+
+  const saveUnit = (f) => {
+    commit((d) => {
+      if (f.id) {
+        const u = d.units.find((x) => x.id === f.id);
+        Object.assign(u, { ...f, rent: num(f.rent) });
+      } else {
+        d.units.push({ ...f, id: uid(), rent: num(f.rent) });
+      }
+    }, `${f.id ? "Updated" : "Added"} unit ${f.number}`, f.id ? "update" : "create");
+    setUnitModal(null);
+    flash("Unit saved.");
+  };
+
+  const delUnit = (u) => {
+    if (leases.some((l) => l.unitId === u.id && l.status === "active"))
+      return flash("End the active lease before removing this unit.");
+    commit((d) => { d.units = d.units.filter((x) => x.id !== u.id); }, `Removed unit ${u.number}`, "delete");
+  };
+
+  const delProp = (p) => {
+    if (units.some((u) => u.propertyId === p.id)) return flash("Remove this property's units first.");
+    commit((d) => { d.properties = d.properties.filter((x) => x.id !== p.id); }, `Removed property ${p.name}`, "delete");
+  };
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Portfolio</h2><p className="sub">Properties, and the units inside them.</p></div>
+        <div className="btnrow">
+          <button className="btn" onClick={() => setPropModal({ name: "", address: "", notes: "" })}>Add property</button>
+          {properties.length > 0 && (
+            <button className="btn primary" onClick={() => setUnitModal({ propertyId: properties[0].id, number: "", type: "Apartment", bedrooms: 1, rent: "" })}>Add unit</button>
+          )}
+        </div>
+      </div>
+
+      {!properties.length && <Empty title="No properties yet" body="A property is the building. Units are the doors inside it." action={<button className="btn primary" onClick={() => setPropModal({ name: "", address: "", notes: "" })}>Add your first property</button>} />}
+
+      {properties.map((p) => {
+        const us = units.filter((u) => u.propertyId === p.id);
+        return (
+          <div key={p.id} className="panel">
+            <div className="panel-head">
+              <div>
+                <h3 className="h3">{p.name}</h3>
+                <div className="quiet">{p.address || "No address recorded"} · {us.length} unit{us.length === 1 ? "" : "s"}</div>
+              </div>
+              <div className="btnrow">
+                <button className="btn small" onClick={() => setUnitModal({ propertyId: p.id, number: "", type: "Apartment", bedrooms: 1, rent: "" })}>Add unit</button>
+                <button className="btn small ghost" onClick={() => setPropModal(p)}>Edit</button>
+                <button className="btn small danger" onClick={() => delProp(p)}>Delete</button>
+              </div>
+            </div>
+            {us.length ? (
+              <table className="table">
+                <thead><tr><th>Unit</th><th>Type</th><th>Beds</th><th className="r">Rent / month</th><th>Occupant</th><th></th></tr></thead>
+                <tbody>
+                  {us.map((u) => {
+                    const lease = leases.find((l) => l.unitId === u.id && l.status === "active");
+                    const t = lease && tenants.find((x) => x.id === lease.tenantId);
+                    return (
+                      <tr key={u.id}>
+                        <td className="mono strong">{u.number}</td>
+                        <td>{u.type}</td>
+                        <td className="mono">{u.bedrooms}</td>
+                        <td className="mono r">{money(u.rent)}</td>
+                        <td>{t ? t.name : <span className="chip grey">Vacant</span>}</td>
+                        <td className="r nowrap">
+                          <button className="btn tiny ghost" onClick={() => setUnitModal(u)}>Edit</button>
+                          <button className="btn tiny danger" onClick={() => delUnit(u)}>Delete</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            ) : <div className="quiet pad">No units on this property yet.</div>}
+          </div>
+        );
+      })}
+
+      {propModal && (
+        <Modal title={propModal.id ? "Edit property" : "Add property"} onClose={() => setPropModal(null)}>
+          <FormBody
+            fields={[
+              { k: "name", label: "Property name", required: true },
+              { k: "address", label: "Address" },
+              { k: "notes", label: "Notes", type: "textarea" },
+            ]}
+            init={propModal}
+            onSave={saveProp}
+          />
+        </Modal>
+      )}
+
+      {unitModal && (
+        <Modal title={unitModal.id ? "Edit unit" : "Add unit"} onClose={() => setUnitModal(null)}>
+          <FormBody
+            fields={[
+              { k: "propertyId", label: "Property", type: "select", options: properties.map((p) => ({ v: p.id, l: p.name })) },
+              { k: "number", label: "Unit number", required: true, placeholder: "A3" },
+              { k: "type", label: "Type", type: "select", options: ["Apartment", "Studio", "Self-contained", "Shop", "Office", "House"].map((v) => ({ v, l: v })) },
+              { k: "bedrooms", label: "Bedrooms", type: "number" },
+              { k: "rent", label: `Rent per month (${settings.currency})`, type: "number", required: true },
+            ]}
+            init={unitModal}
+            onSave={saveUnit}
+          />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   TENANTS & LEASES
+   ============================================================ */
+function Tenants({ data, commit, flash }) {
+  const { tenants, leases, units, properties, invoices, payments, settings } = data;
+  const money = useMoney(settings);
+  const [tModal, setTModal] = useState(null);
+  const [lModal, setLModal] = useState(null);
+
+  const saveTenant = (f) => {
+    commit((d) => {
+      if (f.id) Object.assign(d.tenants.find((x) => x.id === f.id), f);
+      else d.tenants.push({ ...f, id: uid() });
+    }, `${f.id ? "Updated" : "Added"} tenant ${f.name}`, f.id ? "update" : "create");
+    setTModal(null); flash("Tenant saved.");
+  };
+
+  const saveLease = (f) => {
+    if (!f.id && leases.some((l) => l.unitId === f.unitId && l.status === "active"))
+      return flash("That unit already has an active lease.");
+    commit((d) => {
+      const rec = { ...f, rent: num(f.rent), deposit: num(f.deposit) };
+      if (f.id) Object.assign(d.leases.find((x) => x.id === f.id), rec);
+      else d.leases.push({ ...rec, id: uid(), status: "active" });
+    }, `${f.id ? "Updated" : "Created"} lease`, f.id ? "update" : "create");
+    setLModal(null); flash("Lease saved.");
+  };
+
+  const endLease = (l) => {
+    commit((d) => {
+      const rec = d.leases.find((x) => x.id === l.id);
+      rec.status = "ended";
+      rec.endedOn = todayISO();
+    }, `Ended lease on unit ${units.find((u) => u.id === l.unitId)?.number}`, "update");
+    flash("Lease ended. The unit is now vacant.");
+  };
+
+  const balanceFor = (tenantId) =>
+    invoices
+      .filter((i) => i.tenantId === tenantId)
+      .reduce((s, i) => {
+        const st = invoiceState(i, payments, settings);
+        if (["open", "partial", "overdue"].includes(st))
+          return s + (invoiceTotals(i, settings).total - paidOn(i.id, payments));
+        return s;
+      }, 0);
+
+  const unitLabel = (id) => {
+    const u = units.find((x) => x.id === id);
+    if (!u) return "—";
+    const p = properties.find((x) => x.id === u.propertyId);
+    return `${u.number}${p ? " · " + p.name : ""}`;
+  };
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Tenants</h2><p className="sub">People, and the leases that connect them to units.</p></div>
+        <div className="btnrow">
+          <button className="btn" onClick={() => setTModal({ name: "", phone: "", email: "", idNumber: "", emergency: "", notes: "" })}>Add tenant</button>
+          {tenants.length > 0 && units.length > 0 && (
+            <button className="btn primary" onClick={() => setLModal({ tenantId: tenants[0].id, unitId: units[0].id, startDate: todayISO(), endDate: addMonths(todayISO(), 12), rent: units[0].rent, deposit: "", cycle: "monthly" })}>New lease</button>
+          )}
+        </div>
+      </div>
+
+      {!tenants.length && <Empty title="No tenants yet" body="Add a person first, then put them on a lease." action={<button className="btn primary" onClick={() => setTModal({ name: "", phone: "", email: "", idNumber: "", emergency: "", notes: "" })}>Add a tenant</button>} />}
+
+      {tenants.length > 0 && (
+        <div className="panel">
+          <table className="table">
+            <thead><tr><th>Tenant</th><th>Phone</th><th>Unit</th><th>Lease ends</th><th className="r">Balance owed</th><th></th></tr></thead>
+            <tbody>
+              {tenants.map((t) => {
+                const lease = leases.find((l) => l.tenantId === t.id && l.status === "active");
+                const bal = balanceFor(t.id);
+                return (
+                  <tr key={t.id}>
+                    <td><strong>{t.name}</strong><div className="quiet small">{t.email}</div></td>
+                    <td className="mono">{t.phone || "—"}</td>
+                    <td>{lease ? unitLabel(lease.unitId) : <span className="chip grey">No lease</span>}</td>
+                    <td className="mono">{lease?.endDate || "—"}</td>
+                    <td className={"mono r " + (bal > 0 ? "rust-text strong" : "")}>{money(bal)}</td>
+                    <td className="r nowrap">
+                      <button className="btn tiny ghost" onClick={() => setTModal(t)}>Edit</button>
+                      {lease && <button className="btn tiny danger" onClick={() => endLease(lease)}>End lease</button>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {leases.length > 0 && (
+        <div className="panel">
+          <div className="panel-head"><h3 className="h3">Leases</h3></div>
+          <table className="table">
+            <thead><tr><th>Unit</th><th>Tenant</th><th>Start</th><th>End</th><th className="r">Rent</th><th className="r">Deposit held</th><th>Status</th></tr></thead>
+            <tbody>
+              {leases.map((l) => {
+                const t = tenants.find((x) => x.id === l.tenantId);
+                return (
+                  <tr key={l.id}>
+                    <td className="mono strong">{unitLabel(l.unitId)}</td>
+                    <td>{t?.name || "—"}</td>
+                    <td className="mono">{l.startDate}</td>
+                    <td className="mono">{l.endDate || "—"}</td>
+                    <td className="mono r">{money(l.rent)}</td>
+                    <td className="mono r">{money(l.deposit)}</td>
+                    <td><span className={"chip " + (l.status === "active" ? "moss" : "grey")}>{l.status}</span></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tModal && (
+        <Modal title={tModal.id ? "Edit tenant" : "Add tenant"} onClose={() => setTModal(null)}>
+          <FormBody
+            fields={[
+              { k: "name", label: "Full name", required: true },
+              { k: "phone", label: "Phone" },
+              { k: "email", label: "Email" },
+              { k: "idNumber", label: "ID number" },
+              { k: "emergency", label: "Emergency contact" },
+              { k: "notes", label: "Notes", type: "textarea" },
+            ]}
+            init={tModal}
+            onSave={saveTenant}
+          />
+        </Modal>
+      )}
+
+      {lModal && (
+        <Modal title="New lease" onClose={() => setLModal(null)}>
+          <FormBody
+            fields={[
+              { k: "tenantId", label: "Tenant", type: "select", options: tenants.map((t) => ({ v: t.id, l: t.name })) },
+              { k: "unitId", label: "Unit", type: "select", options: units.filter((u) => !leases.some((l) => l.unitId === u.id && l.status === "active")).map((u) => ({ v: u.id, l: unitLabel(u.id) })) },
+              { k: "startDate", label: "Start date", type: "date" },
+              { k: "endDate", label: "End date", type: "date" },
+              { k: "rent", label: `Rent per month (${settings.currency})`, type: "number", required: true },
+              { k: "deposit", label: `Deposit held (${settings.currency})`, type: "number" },
+            ]}
+            init={lModal}
+            onSave={saveLease}
+          />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   INVOICES
+   ============================================================ */
+function Invoices({ data, commit, flash }) {
+  const { invoices, tenants, units, leases, payments, settings } = data;
+  const money = useMoney(settings);
+  const [editing, setEditing] = useState(null);
+  const [paying, setPaying] = useState(null);
+  const [viewing, setViewing] = useState(null);
+  const [filter, setFilter] = useState("all");
+
+  const shown = invoices.filter((i) => filter === "all" || invoiceState(i, payments, settings) === filter);
+
+  const blank = () => ({
+    tenantId: tenants[0]?.id || "",
+    unitId: units[0]?.id || "",
+    issueDate: todayISO(),
+    dueDate: addDays(todayISO(), 7),
+    items: [{ desc: "", qty: 1, rate: "" }],
+    vatApplied: settings.vatEnabled,
+    notes: "",
+    status: "sent",
+    kind: "other",
+  });
+
+  const saveInvoice = (f) => {
+    commit((d) => {
+      if (f.id) {
+        Object.assign(d.invoices.find((x) => x.id === f.id), f);
+      } else {
+        const n = d.counters.invoice++;
+        const lease = d.leases.find((l) => l.unitId === f.unitId && l.status === "active");
+        d.invoices.unshift({
+          ...f,
+          id: uid(),
+          number: `${d.settings.invoicePrefix}-${String(n).padStart(4, "0")}`,
+          leaseId: lease?.id || null,
+        });
+      }
+    }, `${f.id ? "Edited" : "Issued"} invoice ${f.number || "(new)"}`, f.id ? "update" : "create");
+    setEditing(null); flash("Invoice saved.");
+  };
+
+  const recordPayment = (inv, p) => {
+    commit((d) => {
+      const n = d.counters.receipt++;
+      d.payments.unshift({
+        id: uid(),
+        invoiceId: inv.id,
+        tenantId: inv.tenantId,
+        date: p.date,
+        amount: num(p.amount),
+        method: p.method,
+        reference: p.reference,
+        receiptNumber: `${d.settings.receiptPrefix}-${String(n).padStart(4, "0")}`,
+      });
+    }, `Payment of ${money(num(p.amount))} on ${inv.number}`, "payment");
+    setPaying(null);
+    flash("Payment recorded. Receipt issued.");
+  };
+
+  const voidInvoice = (inv) =>
+    commit((d) => { d.invoices.find((x) => x.id === inv.id).status = "void"; }, `Voided invoice ${inv.number}`, "update");
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Invoices</h2><p className="sub">What you've billed, and what's been settled.</p></div>
+        <button className="btn primary" onClick={() => setEditing(blank())} disabled={!tenants.length}>New invoice</button>
+      </div>
+
+      <div className="tabs">
+        {["all", "open", "partial", "overdue", "paid", "draft"].map((f) => (
+          <button key={f} className={"tab" + (filter === f ? " on" : "")} onClick={() => setFilter(f)}>
+            {f === "all" ? "All" : STATE_META[f].label}
+          </button>
+        ))}
+      </div>
+
+      {!shown.length ? (
+        <Empty title="Nothing here" body={filter === "all" ? "Issue an invoice, or generate the month's rent from the dashboard." : "No invoices in this state."} />
+      ) : (
+        <div className="panel">
+          <table className="table">
+            <thead><tr><th>Number</th><th>Tenant</th><th>Unit</th><th>Issued</th><th>Due</th><th className="r">Total</th><th className="r">Paid</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {shown.map((i) => {
+                const st = invoiceState(i, payments, settings);
+                const { total } = invoiceTotals(i, settings);
+                const paid = paidOn(i.id, payments);
+                const t = tenants.find((x) => x.id === i.tenantId);
+                const u = units.find((x) => x.id === i.unitId);
+                return (
+                  <tr key={i.id}>
+                    <td className="mono strong">{i.number}</td>
+                    <td>{t?.name || "—"}</td>
+                    <td className="mono">{u?.number || "—"}</td>
+                    <td className="mono small">{i.issueDate}</td>
+                    <td className="mono small">{i.dueDate}</td>
+                    <td className="mono r">{money(total)}</td>
+                    <td className="mono r">{money(paid)}</td>
+                    <td><span className={"chip " + STATE_META[st].tone}>{STATE_META[st].label}</span></td>
+                    <td className="r nowrap">
+                      <button className="btn tiny ghost" onClick={() => setViewing(i)}>View</button>
+                      {!["paid", "void"].includes(st) && <button className="btn tiny" onClick={() => setPaying(i)}>Pay</button>}
+                      {st !== "void" && <button className="btn tiny danger" onClick={() => voidInvoice(i)}>Void</button>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {editing && (
+        <Modal title="New invoice" wide onClose={() => setEditing(null)}>
+          <LineItemForm
+            init={editing}
+            settings={settings}
+            people={tenants}
+            units={units}
+            onSave={saveInvoice}
+            dateLabels={["Issue date", "Due date"]}
+            dateKeys={["issueDate", "dueDate"]}
+          />
+        </Modal>
+      )}
+
+      {paying && (
+        <Modal title={`Record payment · ${paying.number}`} onClose={() => setPaying(null)}>
+          <PaymentForm
+            invoice={paying}
+            settings={settings}
+            payments={payments}
+            onSave={(p) => recordPayment(paying, p)}
+          />
+        </Modal>
+      )}
+
+      {viewing && (
+        <Modal title={viewing.number} wide onClose={() => setViewing(null)}>
+          <DocumentView doc={viewing} data={data} kind="invoice" />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   QUOTES
+   ============================================================ */
+function Quotes({ data, commit, flash }) {
+  const { quotes, tenants, units, settings, payments } = data;
+  const money = useMoney(settings);
+  const [editing, setEditing] = useState(null);
+  const [viewing, setViewing] = useState(null);
+
+  const saveQuote = (f) => {
+    commit((d) => {
+      if (f.id) Object.assign(d.quotes.find((x) => x.id === f.id), f);
+      else {
+        const n = d.counters.quote++;
+        d.quotes.unshift({ ...f, id: uid(), number: `${d.settings.quotePrefix}-${String(n).padStart(4, "0")}`, status: "sent" });
+      }
+    }, `${f.id ? "Edited" : "Issued"} quote`, f.id ? "update" : "create");
+    setEditing(null); flash("Quote saved.");
+  };
+
+  const convert = (q) => {
+    commit((d) => {
+      const n = d.counters.invoice++;
+      const lease = d.leases.find((l) => l.unitId === q.unitId && l.status === "active");
+      d.invoices.unshift({
+        id: uid(),
+        number: `${d.settings.invoicePrefix}-${String(n).padStart(4, "0")}`,
+        kind: "works",
+        tenantId: q.tenantId,
+        unitId: q.unitId,
+        leaseId: lease?.id || null,
+        issueDate: todayISO(),
+        dueDate: addDays(todayISO(), 7),
+        items: JSON.parse(JSON.stringify(q.items)),
+        vatApplied: q.vatApplied,
+        status: "sent",
+        notes: `Converted from quote ${q.number}`,
+      });
+      d.quotes.find((x) => x.id === q.id).status = "accepted";
+    }, `Converted quote ${q.number} to an invoice`, "create");
+    flash("Quote converted. Find it under Invoices.");
+  };
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Quotes</h2><p className="sub">Priced work, before it's billed. Accept one and it becomes an invoice.</p></div>
+        <button className="btn primary" onClick={() => setEditing({ tenantId: tenants[0]?.id || "", unitId: units[0]?.id || "", issueDate: todayISO(), dueDate: addMonths(todayISO(), 1), items: [{ desc: "", qty: 1, rate: "" }], vatApplied: settings.vatEnabled, notes: "" })} disabled={!units.length}>New quote</button>
+      </div>
+
+      {!quotes.length ? (
+        <Empty title="No quotes yet" body="Use a quote to price repairs or works before committing the tenant to a bill." />
+      ) : (
+        <div className="panel">
+          <table className="table">
+            <thead><tr><th>Number</th><th>For</th><th>Unit</th><th>Issued</th><th>Valid until</th><th className="r">Total</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {quotes.map((q) => {
+                const { total } = invoiceTotals(q, settings);
+                const t = tenants.find((x) => x.id === q.tenantId);
+                const u = units.find((x) => x.id === q.unitId);
+                return (
+                  <tr key={q.id}>
+                    <td className="mono strong">{q.number}</td>
+                    <td>{t?.name || "—"}</td>
+                    <td className="mono">{u?.number || "—"}</td>
+                    <td className="mono small">{q.issueDate}</td>
+                    <td className="mono small">{q.dueDate}</td>
+                    <td className="mono r">{money(total)}</td>
+                    <td><span className={"chip " + (q.status === "accepted" ? "moss" : q.status === "declined" ? "rust" : "blue")}>{q.status}</span></td>
+                    <td className="r nowrap">
+                      <button className="btn tiny ghost" onClick={() => setViewing(q)}>View</button>
+                      {q.status === "sent" && <button className="btn tiny" onClick={() => convert(q)}>Accept</button>}
+                      {q.status === "sent" && <button className="btn tiny danger" onClick={() => commit((d) => { d.quotes.find((x) => x.id === q.id).status = "declined"; }, `Quote ${q.number} declined`, "update")}>Decline</button>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {editing && (
+        <Modal title="New quote" wide onClose={() => setEditing(null)}>
+          <LineItemForm
+            init={editing}
+            settings={settings}
+            people={tenants}
+            units={units}
+            onSave={saveQuote}
+            dateLabels={["Issue date", "Valid until"]}
+            dateKeys={["issueDate", "dueDate"]}
+          />
+        </Modal>
+      )}
+
+      {viewing && (
+        <Modal title={viewing.number} wide onClose={() => setViewing(null)}>
+          <DocumentView doc={viewing} data={data} kind="quote" />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   RECEIPTS
+   ============================================================ */
+function Receipts({ data }) {
+  const { payments, tenants, invoices, units, settings } = data;
+  const money = useMoney(settings);
+  const [viewing, setViewing] = useState(null);
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Receipts</h2><p className="sub">One receipt per payment, issued automatically. Nothing to fill in.</p></div>
+      </div>
+
+      {!payments.length ? (
+        <Empty title="No receipts yet" body="Record a payment against an invoice and the receipt appears here." />
+      ) : (
+        <div className="panel">
+          <table className="table">
+            <thead><tr><th>Receipt</th><th>Date</th><th>Tenant</th><th>Unit</th><th>Against</th><th>Method</th><th className="r">Amount</th><th></th></tr></thead>
+            <tbody>
+              {payments.map((p) => {
+                const inv = invoices.find((i) => i.id === p.invoiceId);
+                const t = tenants.find((x) => x.id === p.tenantId);
+                const u = inv && units.find((x) => x.id === inv.unitId);
+                return (
+                  <tr key={p.id}>
+                    <td className="mono strong">{p.receiptNumber}</td>
+                    <td className="mono small">{p.date}</td>
+                    <td>{t?.name || "—"}</td>
+                    <td className="mono">{u?.number || "—"}</td>
+                    <td className="mono small">{inv?.number || "—"}</td>
+                    <td>{p.method}</td>
+                    <td className="mono r strong moss-text">{money(p.amount)}</td>
+                    <td className="r"><button className="btn tiny ghost" onClick={() => setViewing(p)}>View</button></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {viewing && (
+        <Modal title={viewing.receiptNumber} wide onClose={() => setViewing(null)}>
+          <ReceiptView payment={viewing} data={data} />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   MAINTENANCE
+   ============================================================ */
+function Maintenance({ data, commit, flash }) {
+  const { maintenance, units, settings } = data;
+  const money = useMoney(settings);
+  const [editing, setEditing] = useState(null);
+
+  const save = (f) => {
+    commit((d) => {
+      if (f.id) Object.assign(d.maintenance.find((x) => x.id === f.id), { ...f, cost: num(f.cost) });
+      else d.maintenance.unshift({ ...f, id: uid(), cost: num(f.cost), status: "open", reportedDate: todayISO() });
+    }, `${f.id ? "Updated" : "Logged"} job: ${f.title}`, f.id ? "update" : "create");
+    setEditing(null); flash("Job saved.");
+  };
+
+  const resolve = (m) => {
+    commit((d) => {
+      const rec = d.maintenance.find((x) => x.id === m.id);
+      rec.status = "resolved";
+      rec.resolvedDate = todayISO();
+      if (num(rec.cost) > 0) {
+        d.expenses.unshift({
+          id: uid(),
+          date: todayISO(),
+          category: "Repairs",
+          description: `${rec.title} — Unit ${d.units.find((u) => u.id === rec.unitId)?.number || "?"}`,
+          amount: num(rec.cost),
+          unitId: rec.unitId,
+        });
+      }
+    }, `Resolved job: ${m.title}`, "update");
+    flash(num(m.cost) > 0 ? "Job resolved. Cost posted to expenses." : "Job resolved.");
+  };
+
+  const open = maintenance.filter((m) => m.status !== "resolved");
+  const done = maintenance.filter((m) => m.status === "resolved");
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Maintenance</h2><p className="sub">Jobs on the units. Resolving one with a cost posts it straight to expenses.</p></div>
+        <button className="btn primary" onClick={() => setEditing({ unitId: units[0]?.id || "", title: "", description: "", priority: "normal", cost: "" })} disabled={!units.length}>Log a job</button>
+      </div>
+
+      {!maintenance.length && <Empty title="Nothing broken" body="Log a job when a tenant reports something, and track it to done." />}
+
+      {open.length > 0 && (
+        <div className="panel">
+          <div className="panel-head"><h3 className="h3">Open</h3></div>
+          <table className="table">
+            <thead><tr><th>Job</th><th>Unit</th><th>Reported</th><th>Priority</th><th className="r">Est. cost</th><th></th></tr></thead>
+            <tbody>
+              {open.map((m) => (
+                <tr key={m.id}>
+                  <td><strong>{m.title}</strong><div className="quiet small">{m.description}</div></td>
+                  <td className="mono">{units.find((u) => u.id === m.unitId)?.number || "—"}</td>
+                  <td className="mono small">{m.reportedDate}</td>
+                  <td><span className={"chip " + (m.priority === "urgent" ? "rust" : m.priority === "high" ? "brass" : "grey")}>{m.priority}</span></td>
+                  <td className="mono r">{money(m.cost)}</td>
+                  <td className="r nowrap">
+                    <button className="btn tiny ghost" onClick={() => setEditing(m)}>Edit</button>
+                    <button className="btn tiny" onClick={() => resolve(m)}>Resolve</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {done.length > 0 && (
+        <div className="panel">
+          <div className="panel-head"><h3 className="h3">Resolved</h3></div>
+          <table className="table">
+            <thead><tr><th>Job</th><th>Unit</th><th>Resolved</th><th className="r">Cost</th></tr></thead>
+            <tbody>
+              {done.map((m) => (
+                <tr key={m.id}>
+                  <td>{m.title}</td>
+                  <td className="mono">{units.find((u) => u.id === m.unitId)?.number || "—"}</td>
+                  <td className="mono small">{m.resolvedDate}</td>
+                  <td className="mono r">{money(m.cost)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {editing && (
+        <Modal title={editing.id ? "Edit job" : "Log a job"} onClose={() => setEditing(null)}>
+          <FormBody
+            fields={[
+              { k: "unitId", label: "Unit", type: "select", options: units.map((u) => ({ v: u.id, l: u.number })) },
+              { k: "title", label: "What's the problem?", required: true, placeholder: "Kitchen tap leaking" },
+              { k: "description", label: "Details", type: "textarea" },
+              { k: "priority", label: "Priority", type: "select", options: ["low", "normal", "high", "urgent"].map((v) => ({ v, l: v })) },
+              { k: "cost", label: `Cost (${settings.currency})`, type: "number" },
+            ]}
+            init={editing}
+            onSave={save}
+          />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   EXPENSES
+   ============================================================ */
+const EXPENSE_CATS = ["Repairs", "Utilities", "Security", "Cleaning", "Salaries", "Insurance", "Rates & taxes", "Other"];
+
+function Expenses({ data, commit, flash }) {
+  const { expenses, units, settings } = data;
+  const money = useMoney(settings);
+  const [editing, setEditing] = useState(null);
+
+  const save = (f) => {
+    commit((d) => {
+      if (f.id) Object.assign(d.expenses.find((x) => x.id === f.id), { ...f, amount: num(f.amount) });
+      else d.expenses.unshift({ ...f, id: uid(), amount: num(f.amount) });
+    }, `${f.id ? "Edited" : "Recorded"} expense: ${f.description}`, f.id ? "update" : "create");
+    setEditing(null); flash("Expense saved.");
+  };
+
+  const total = expenses.reduce((s, e) => s + num(e.amount), 0);
+  const thisMonth = expenses.filter((e) => monthKey(e.date) === monthKey()).reduce((s, e) => s + num(e.amount), 0);
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Expenses</h2><p className="sub">What the buildings cost you. Without this, reports only tell half the story.</p></div>
+        <button className="btn primary" onClick={() => setEditing({ date: todayISO(), category: "Repairs", description: "", amount: "", unitId: "" })}>Record expense</button>
+      </div>
+
+      <div className="statrow">
+        <Stat label={`Spent · ${monthLabel(monthKey())}`} value={money(thisMonth)} sub="This month" tone="rust" />
+        <Stat label="Spent all time" value={money(total)} sub={`${expenses.length} entries`} />
+      </div>
+
+      {!expenses.length ? (
+        <Empty title="No expenses recorded" body="Repairs resolved in Maintenance land here automatically. Add anything else by hand." />
+      ) : (
+        <div className="panel">
+          <table className="table">
+            <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Unit</th><th className="r">Amount</th></tr></thead>
+            <tbody>
+              {expenses.map((e) => (
+                <tr key={e.id}>
+                  <td className="mono small">{e.date}</td>
+                  <td><span className="chip grey">{e.category}</span></td>
+                  <td>{e.description}</td>
+                  <td className="mono">{units.find((u) => u.id === e.unitId)?.number || "—"}</td>
+                  <td className="mono r rust-text">{money(e.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {editing && (
+        <Modal title="Record expense" onClose={() => setEditing(null)}>
+          <FormBody
+            fields={[
+              { k: "date", label: "Date", type: "date" },
+              { k: "category", label: "Category", type: "select", options: EXPENSE_CATS.map((v) => ({ v, l: v })) },
+              { k: "description", label: "Description", required: true },
+              { k: "amount", label: `Amount (${settings.currency})`, type: "number", required: true },
+              { k: "unitId", label: "Unit (optional)", type: "select", options: [{ v: "", l: "Not unit-specific" }, ...units.map((u) => ({ v: u.id, l: u.number }))] },
+            ]}
+            init={editing}
+            onSave={save}
+          />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   REPORTS
+   ============================================================ */
+function Reports({ data, flash }) {
+  const { units, properties, leases, tenants, invoices, payments, expenses, settings } = data;
+  const money = useMoney(settings);
+
+  const months = useMemo(() => {
+    const out = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      out.push(d.toISOString().slice(0, 7));
+    }
+    return out;
+  }, []);
+
+  const series = months.map((mk) => {
+    const billed = invoices
+      .filter((i) => monthKey(i.issueDate) === mk && !["draft", "void"].includes(i.status))
+      .reduce((s, i) => s + invoiceTotals(i, settings).total, 0);
+    const collected = payments.filter((p) => monthKey(p.date) === mk).reduce((s, p) => s + num(p.amount), 0);
+    const spent = expenses.filter((e) => monthKey(e.date) === mk).reduce((s, e) => s + num(e.amount), 0);
+    return { mk, billed, collected, spent, net: collected - spent };
+  });
+  const peak = Math.max(1, ...series.map((s) => Math.max(s.billed, s.collected, s.spent)));
+
+  const activeLeases = leases.filter((l) => l.status === "active");
+  const rentRoll = activeLeases.map((l) => {
+    const u = units.find((x) => x.id === l.unitId);
+    const p = u && properties.find((x) => x.id === u.propertyId);
+    const t = tenants.find((x) => x.id === l.tenantId);
+    const owed = invoices
+      .filter((i) => i.leaseId === l.id)
+      .reduce((s, i) => {
+        const st = invoiceState(i, payments, settings);
+        return ["open", "partial", "overdue"].includes(st)
+          ? s + (invoiceTotals(i, settings).total - paidOn(i.id, payments))
+          : s;
+      }, 0);
+    return { property: p?.name || "—", unit: u?.number || "—", tenant: t?.name || "—", rent: num(l.rent), ends: l.endDate || "", owed };
+  });
+
+  const monthlyPotential = activeLeases.reduce((s, l) => s + num(l.rent), 0);
+  const totalCollected = payments.reduce((s, p) => s + num(p.amount), 0);
+  const totalSpent = expenses.reduce((s, e) => s + num(e.amount), 0);
+
+  const byCat = EXPENSE_CATS.map((c) => ({
+    cat: c,
+    amt: expenses.filter((e) => e.category === c).reduce((s, e) => s + num(e.amount), 0),
+  })).filter((x) => x.amt > 0).sort((a, b) => b.amt - a.amt);
+
+  const exportCSV = (rows, name) => {
+    const csv = rows.map((r) => r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    flash("Exported.");
+  };
+
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Reports</h2><p className="sub">Six months of money, and the rent roll as it stands today.</p></div>
+      </div>
+
+      <div className="statrow">
+        <Stat label="Monthly rent potential" value={money(monthlyPotential)} sub="If every active lease pays" />
+        <Stat label="Collected all time" value={money(totalCollected)} sub="Every payment recorded" tone="moss" />
+        <Stat label="Spent all time" value={money(totalSpent)} sub="Every expense recorded" tone="rust" />
+        <Stat label="Net" value={money(totalCollected - totalSpent)} sub="Collected less spent" tone={totalCollected - totalSpent >= 0 ? "moss" : "rust"} />
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><h3 className="h3">Billed, collected, spent</h3><span className="quiet">Last six months</span></div>
+        <div className="chart">
+          {series.map((s) => (
+            <div key={s.mk} className="chart-col">
+              <div className="bars">
+                <div className="bar billed" style={{ height: `${(s.billed / peak) * 100}%` }} title={`Billed ${money(s.billed)}`} />
+                <div className="bar collected" style={{ height: `${(s.collected / peak) * 100}%` }} title={`Collected ${money(s.collected)}`} />
+                <div className="bar spent" style={{ height: `${(s.spent / peak) * 100}%` }} title={`Spent ${money(s.spent)}`} />
+              </div>
+              <div className="chart-label">{monthLabel(s.mk).split(" ")[0]}</div>
+            </div>
+          ))}
+        </div>
+        <div className="legend pad">
+          <span><i className="pip blue" /> Billed</span>
+          <span><i className="pip moss" /> Collected</span>
+          <span><i className="pip rust" /> Spent</span>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head">
+          <h3 className="h3">Rent roll</h3>
+          <button className="btn small ghost" onClick={() => exportCSV(
+            [["Property", "Unit", "Tenant", "Rent", "Lease ends", "Owed"], ...rentRoll.map((r) => [r.property, r.unit, r.tenant, r.rent, r.ends, r.owed])],
+            "rent-roll.csv"
+          )}>Export CSV</button>
+        </div>
+        {rentRoll.length ? (
+          <table className="table">
+            <thead><tr><th>Property</th><th>Unit</th><th>Tenant</th><th className="r">Rent</th><th>Lease ends</th><th className="r">Owed now</th></tr></thead>
+            <tbody>
+              {rentRoll.map((r, idx) => (
+                <tr key={idx}>
+                  <td>{r.property}</td>
+                  <td className="mono strong">{r.unit}</td>
+                  <td>{r.tenant}</td>
+                  <td className="mono r">{money(r.rent)}</td>
+                  <td className="mono small">{r.ends || "—"}</td>
+                  <td className={"mono r " + (r.owed > 0 ? "rust-text strong" : "")}>{money(r.owed)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : <div className="quiet pad">No active leases.</div>}
+      </div>
+
+      {byCat.length > 0 && (
+        <div className="panel">
+          <div className="panel-head">
+            <h3 className="h3">Where the money went</h3>
+            <button className="btn small ghost" onClick={() => exportCSV(
+              [["Date", "Category", "Description", "Amount"], ...expenses.map((e) => [e.date, e.category, e.description, e.amount])],
+              "expenses.csv"
+            )}>Export CSV</button>
+          </div>
+          <table className="table">
+            <thead><tr><th>Category</th><th className="r">Amount</th><th>Share</th></tr></thead>
+            <tbody>
+              {byCat.map((c) => (
+                <tr key={c.cat}>
+                  <td>{c.cat}</td>
+                  <td className="mono r">{money(c.amt)}</td>
+                  <td><div className="meter"><div style={{ width: `${(c.amt / byCat[0].amt) * 100}%` }} /></div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   ACTIVITY LOG
+   ============================================================ */
+function Activity({ data }) {
+  const { activity } = data;
+  const TONE = { create: "moss", update: "blue", delete: "rust", payment: "brass", system: "grey" };
+  return (
+    <>
+      <div className="section-head">
+        <div><h2 className="h2">Activity log</h2><p className="sub">Every change, in order. The last 500 are kept.</p></div>
+      </div>
+      {!activity.length ? (
+        <Empty title="Nothing logged yet" body="Anything you create, edit, or delete shows up here." />
+      ) : (
+        <div className="panel">
+          <ul className="log">
+            {activity.map((a) => (
+              <li key={a.id}>
+                <span className={"chip " + (TONE[a.type] || "grey")}>{a.type}</span>
+                <span className="log-msg">{a.message}</span>
+                <span className="mono small quiet">{new Date(a.ts).toLocaleString()}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   SETTINGS
+   ============================================================ */
+function Settings({ data, commit, flash }) {
+  const [f, setF] = useState(data.settings);
+  const [pc, setPc] = useState({ current: "", next: "", confirm: "" });
+  const [danger, setDanger] = useState(false);
+
+  const saveSettings = () => {
+    commit((d) => {
+      d.settings = { ...d.settings, ...f, vatRate: num(f.vatRate), gracePeriodDays: num(f.gracePeriodDays) };
+    }, "Updated settings", "system");
+    flash("Settings saved.");
+  };
+
+  const changePasscode = () => {
+    if (pc.current !== data.settings.passcode) return flash("Current passcode is wrong.");
+    if (pc.next.length < 4) return flash("New passcode must be at least 4 characters.");
+    if (pc.next !== pc.confirm) return flash("New passcodes don't match.");
+    commit((d) => { d.settings.passcode = pc.next; }, "Changed passcode", "system");
+    setPc({ current: "", next: "", confirm: "" });
+    flash("Passcode changed.");
+  };
+
+  const exportAll = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `backup-${todayISO()}.json`;
+    a.click();
+    flash("Backup downloaded.");
+  };
+
+  const importAll = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const parsed = JSON.parse(r.result);
+        commit((d) => { Object.keys(DEFAULTS).forEach((k) => { if (parsed[k] !== undefined) d[k] = parsed[k]; }); }, "Restored from backup", "system");
+        flash("Backup restored.");
+      } catch { flash("That file isn't a valid backup."); }
+    };
+    r.readAsText(file);
+  };
+
+  const wipe = () => {
+    commit((d) => {
+      const keep = d.settings;
+      Object.keys(DEFAULTS).forEach((k) => { if (k !== "settings") d[k] = JSON.parse(JSON.stringify(DEFAULTS[k])); });
+      d.settings = keep;
+    }, "Erased all records", "system");
+    setDanger(false);
+    flash("All records erased. Settings kept.");
+  };
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-head"><h3 className="h3">Business details</h3><span className="quiet">These print on every invoice and receipt.</span></div>
+        <div className="pad">
+          <div className="row2">
+            <Field label="Business name"><input className="input" value={f.businessName} onChange={(e) => setF({ ...f, businessName: e.target.value })} /></Field>
+            <Field label="Manager name"><input className="input" value={f.ownerName} onChange={(e) => setF({ ...f, ownerName: e.target.value })} /></Field>
+          </div>
+          <div className="row2">
+            <Field label="Phone"><input className="input" value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} /></Field>
+            <Field label="Email"><input className="input" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} /></Field>
+          </div>
+          <Field label="Address"><input className="input" value={f.address} onChange={(e) => setF({ ...f, address: e.target.value })} /></Field>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><h3 className="h3">Money & documents</h3></div>
+        <div className="pad">
+          <div className="row2">
+            <Field label="Currency">
+              <select className="input" value={f.currency} onChange={(e) => setF({ ...f, currency: e.target.value })}>
+                {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code} — {c.symbol}</option>)}
+              </select>
+            </Field>
+            <Field label="Days of grace before an invoice reads as overdue">
+              <input className="input mono" type="number" value={f.gracePeriodDays} onChange={(e) => setF({ ...f, gracePeriodDays: e.target.value })} />
+            </Field>
+          </div>
+          <div className="row3">
+            <Field label="Invoice prefix"><input className="input mono" value={f.invoicePrefix} onChange={(e) => setF({ ...f, invoicePrefix: e.target.value })} /></Field>
+            <Field label="Quote prefix"><input className="input mono" value={f.quotePrefix} onChange={(e) => setF({ ...f, quotePrefix: e.target.value })} /></Field>
+            <Field label="Receipt prefix"><input className="input mono" value={f.receiptPrefix} onChange={(e) => setF({ ...f, receiptPrefix: e.target.value })} /></Field>
+          </div>
+          <label className="check">
+            <input type="checkbox" checked={f.vatEnabled} onChange={(e) => setF({ ...f, vatEnabled: e.target.checked })} />
+            <span>Apply tax to new invoices by default</span>
+          </label>
+          {f.vatEnabled && (
+            <div className="row2">
+              <Field label="Tax label"><input className="input" value={f.vatLabel} onChange={(e) => setF({ ...f, vatLabel: e.target.value })} /></Field>
+              <Field label="Rate (%)"><input className="input mono" type="number" value={f.vatRate} onChange={(e) => setF({ ...f, vatRate: e.target.value })} /></Field>
+            </div>
+          )}
+          <button className="btn primary" onClick={saveSettings}>Save settings</button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><h3 className="h3">Passcode</h3></div>
+        <div className="pad">
+          <div className="row3">
+            <Field label="Current"><input className="input" type="password" value={pc.current} onChange={(e) => setPc({ ...pc, current: e.target.value })} /></Field>
+            <Field label="New"><input className="input" type="password" value={pc.next} onChange={(e) => setPc({ ...pc, next: e.target.value })} /></Field>
+            <Field label="Confirm"><input className="input" type="password" value={pc.confirm} onChange={(e) => setPc({ ...pc, confirm: e.target.value })} /></Field>
+          </div>
+          <button className="btn" onClick={changePasscode}>Change passcode</button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><h3 className="h3">Backup</h3><span className="quiet">Download a copy you can restore from.</span></div>
+        <div className="pad btnrow">
+          <button className="btn" onClick={exportAll}>Download backup</button>
+          <label className="btn ghost file">
+            Restore from backup
+            <input type="file" accept="application/json" onChange={importAll} />
+          </label>
+        </div>
+      </div>
+
+      <div className="panel danger-panel">
+        <div className="panel-head"><h3 className="h3">Erase records</h3></div>
+        <div className="pad">
+          {!danger ? (
+            <button className="btn danger" onClick={() => setDanger(true)}>Erase all records</button>
+          ) : (
+            <div className="danger-confirm">
+              <p>This deletes every property, tenant, lease, invoice, receipt, and expense. Your settings stay. It cannot be undone — download a backup first.</p>
+              <div className="btnrow">
+                <button className="btn danger" onClick={wipe}>Yes, erase everything</button>
+                <button className="btn ghost" onClick={() => setDanger(false)}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ============================================================
+   DOCUMENT VIEWS (invoice / quote / receipt)
+   ============================================================ */
+function DocumentView({ doc, data, kind }) {
+  const { settings, tenants, units, properties, payments } = data;
+  const money = useMoney(settings);
+  const t = tenants.find((x) => x.id === doc.tenantId);
+  const u = units.find((x) => x.id === doc.unitId);
+  const p = u && properties.find((x) => x.id === u.propertyId);
+  const { sub, vat, total } = invoiceTotals(doc, settings);
+  const paid = kind === "invoice" ? paidOn(doc.id, payments) : 0;
+
+  return (
+    <div className="doc">
+      <div className="doc-head">
+        <div>
+          <div className="doc-biz">{settings.businessName}</div>
+          <div className="quiet small">{settings.address}</div>
+          <div className="quiet small mono">{settings.phone} {settings.email && `· ${settings.email}`}</div>
+        </div>
+        <div className="r">
+          <div className="doc-kind">{kind === "invoice" ? "Invoice" : "Quote"}</div>
+          <div className="doc-no mono">{doc.number}</div>
+        </div>
+      </div>
+
+      <div className="doc-meta">
+        <div><span className="lbl">Billed to</span><strong>{t?.name || "—"}</strong><div className="quiet small mono">{t?.phone}</div></div>
+        <div><span className="lbl">Unit</span><strong className="mono">{u?.number || "—"}</strong><div className="quiet small">{p?.name}</div></div>
+        <div><span className="lbl">Issued</span><strong className="mono">{doc.issueDate}</strong></div>
+        <div><span className="lbl">{kind === "invoice" ? "Due" : "Valid until"}</span><strong className="mono">{doc.dueDate}</strong></div>
+      </div>
+
+      <table className="table doc-table">
+        <thead><tr><th>Description</th><th className="r">Qty</th><th className="r">Rate</th><th className="r">Amount</th></tr></thead>
+        <tbody>
+          {doc.items.map((i, idx) => (
+            <tr key={idx}>
+              <td>{i.desc}</td>
+              <td className="mono r">{i.qty}</td>
+              <td className="mono r">{money(i.rate)}</td>
+              <td className="mono r">{money(num(i.qty) * num(i.rate))}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="doc-totals">
+        <div><span>Subtotal</span><span className="mono">{money(sub)}</span></div>
+        {doc.vatApplied && <div><span>{settings.vatLabel} {settings.vatRate}%</span><span className="mono">{money(vat)}</span></div>}
+        <div className="grand"><span>Total</span><span className="mono">{money(total)}</span></div>
+        {kind === "invoice" && (
+          <>
+            <div><span>Paid</span><span className="mono moss-text">{money(paid)}</span></div>
+            <div className="grand"><span>Balance</span><span className="mono">{money(total - paid)}</span></div>
+          </>
+        )}
+      </div>
+
+      {doc.notes && <div className="doc-notes"><span className="lbl">Notes</span>{doc.notes}</div>}
+      <div className="btnrow r"><button className="btn ghost" onClick={() => window.print()}>Print</button></div>
+    </div>
+  );
+}
+
+function ReceiptView({ payment, data }) {
+  const { settings, tenants, invoices, units } = data;
+  const money = useMoney(settings);
+  const t = tenants.find((x) => x.id === payment.tenantId);
+  const inv = invoices.find((i) => i.id === payment.invoiceId);
+  const u = inv && units.find((x) => x.id === inv.unitId);
+  return (
+    <div className="doc receipt">
+      <div className="doc-head">
+        <div>
+          <div className="doc-biz">{settings.businessName}</div>
+          <div className="quiet small mono">{settings.phone}</div>
+        </div>
+        <div className="r">
+          <div className="doc-kind">Receipt</div>
+          <div className="doc-no mono">{payment.receiptNumber}</div>
+        </div>
+      </div>
+      <div className="receipt-amount">
+        <span className="lbl">Received with thanks</span>
+        <div className="big mono">{money(payment.amount)}</div>
+      </div>
+      <div className="doc-meta">
+        <div><span className="lbl">From</span><strong>{t?.name || "—"}</strong></div>
+        <div><span className="lbl">Unit</span><strong className="mono">{u?.number || "—"}</strong></div>
+        <div><span className="lbl">Date</span><strong className="mono">{payment.date}</strong></div>
+        <div><span className="lbl">Method</span><strong>{payment.method}</strong></div>
+        <div><span className="lbl">Against invoice</span><strong className="mono">{inv?.number || "—"}</strong></div>
+        <div><span className="lbl">Reference</span><strong className="mono">{payment.reference || "—"}</strong></div>
+      </div>
+      <div className="receipt-sig">
+        <div className="sig-line" />
+        <span className="quiet small">{settings.ownerName || "Manager"} · {settings.businessName}</span>
+      </div>
+      <div className="btnrow r"><button className="btn ghost" onClick={() => window.print()}>Print</button></div>
+    </div>
+  );
+}
+
+/* ============================================================
+   FORMS
+   ============================================================ */
+function LineItemForm({ init, settings, people, units, onSave, dateLabels, dateKeys }) {
+  const [f, setF] = useState(init);
+  const [err, setErr] = useState("");
+  const money = useMoney(settings);
+  const setItem = (i, k, v) => {
+    const items = [...f.items];
+    items[i] = { ...items[i], [k]: v };
+    setF({ ...f, items });
+  };
+  const { sub, vat, total } = invoiceTotals(f, settings);
+
+  const submit = () => {
+    if (!f.items.some((i) => i.desc.trim() && num(i.rate) > 0))
+      return setErr("Add at least one line with a description and a rate.");
+    onSave(f);
+  };
+
+  return (
+    <>
+      <div className="row2">
+        <Field label="Tenant">
+          <select className="input" value={f.tenantId} onChange={(e) => setF({ ...f, tenantId: e.target.value })}>
+            {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Unit">
+          <select className="input" value={f.unitId} onChange={(e) => setF({ ...f, unitId: e.target.value })}>
+            {units.map((u) => <option key={u.id} value={u.id}>{u.number}</option>)}
+          </select>
+        </Field>
+      </div>
+      <div className="row2">
+        <Field label={dateLabels[0]}><input className="input mono" type="date" value={f[dateKeys[0]]} onChange={(e) => setF({ ...f, [dateKeys[0]]: e.target.value })} /></Field>
+        <Field label={dateLabels[1]}><input className="input mono" type="date" value={f[dateKeys[1]]} onChange={(e) => setF({ ...f, [dateKeys[1]]: e.target.value })} /></Field>
+      </div>
+
+      <div className="lbl">Lines</div>
+      <div className="items">
+        {f.items.map((it, i) => (
+          <div key={i} className="item-row">
+            <input className="input" placeholder="Description" value={it.desc} onChange={(e) => setItem(i, "desc", e.target.value)} />
+            <input className="input mono" type="number" placeholder="Qty" value={it.qty} onChange={(e) => setItem(i, "qty", e.target.value)} />
+            <input className="input mono" type="number" placeholder="Rate" value={it.rate} onChange={(e) => setItem(i, "rate", e.target.value)} />
+            <div className="item-amt mono">{money(num(it.qty) * num(it.rate))}</div>
+            <button className="btn tiny danger" onClick={() => setF({ ...f, items: f.items.filter((_, x) => x !== i) })} disabled={f.items.length === 1}>×</button>
+          </div>
+        ))}
+      </div>
+      <button className="btn small ghost" onClick={() => setF({ ...f, items: [...f.items, { desc: "", qty: 1, rate: "" }] })}>Add line</button>
+
+      <label className="check">
+        <input type="checkbox" checked={!!f.vatApplied} onChange={(e) => setF({ ...f, vatApplied: e.target.checked })} />
+        <span>Apply {settings.vatLabel} at {settings.vatRate}%</span>
+      </label>
+
+      <Field label="Notes"><textarea className="input" rows="2" value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></Field>
+
+      <div className="form-totals">
+        <div><span>Subtotal</span><span className="mono">{money(sub)}</span></div>
+        {f.vatApplied && <div><span>{settings.vatLabel}</span><span className="mono">{money(vat)}</span></div>}
+        <div className="grand"><span>Total</span><span className="mono">{money(total)}</span></div>
+      </div>
+
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" onClick={submit}>Save</button>
+    </>
+  );
+}
+
+function PaymentForm({ invoice, settings, payments, onSave }) {
+  const money = useMoney(settings);
+  const { total } = invoiceTotals(invoice, settings);
+  const already = paidOn(invoice.id, payments);
+  const balance = total - already;
+  const [f, setF] = useState({ date: todayISO(), amount: balance.toFixed(2), method: "Mobile money", reference: "" });
+  const [err, setErr] = useState("");
+
+  const submit = () => {
+    if (num(f.amount) <= 0) return setErr("Enter an amount greater than zero.");
+    if (num(f.amount) > balance + 0.005) return setErr(`That's more than the ${money(balance)} outstanding.`);
+    onSave(f);
+  };
+
+  return (
+    <>
+      <div className="balance-note">
+        <div><span className="lbl">Invoice total</span><span className="mono">{money(total)}</span></div>
+        <div><span className="lbl">Already paid</span><span className="mono">{money(already)}</span></div>
+        <div className="grand"><span className="lbl">Outstanding</span><span className="mono">{money(balance)}</span></div>
+      </div>
+      <div className="row2">
+        <Field label="Date received"><input className="input mono" type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></Field>
+        <Field label={`Amount (${settings.currency})`}><input className="input mono" type="number" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} /></Field>
+      </div>
+      <div className="row2">
+        <Field label="Method">
+          <select className="input" value={f.method} onChange={(e) => setF({ ...f, method: e.target.value })}>
+            {["Mobile money", "Bank transfer", "Cash", "Cheque", "Card"].map((m) => <option key={m}>{m}</option>)}
+          </select>
+        </Field>
+        <Field label="Reference"><input className="input mono" value={f.reference} onChange={(e) => setF({ ...f, reference: e.target.value })} placeholder="Txn ID" /></Field>
+      </div>
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" onClick={submit}>Record payment</button>
+    </>
+  );
+}
+
+function FormBody({ fields, init, onSave }) {
+  const [f, setF] = useState(init);
+  const [err, setErr] = useState("");
+  const submit = () => {
+    for (const fd of fields) {
+      if (fd.required && !String(f[fd.k] ?? "").trim()) return setErr(`${fd.label} is required.`);
+    }
+    onSave(f);
+  };
+  return (
+    <>
+      {fields.map((fd) => (
+        <Field key={fd.k} label={fd.label}>
+          {fd.type === "select" ? (
+            <select className="input" value={f[fd.k] ?? ""} onChange={(e) => setF({ ...f, [fd.k]: e.target.value })}>
+              {fd.options.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}
+            </select>
+          ) : fd.type === "textarea" ? (
+            <textarea className="input" rows="3" value={f[fd.k] ?? ""} onChange={(e) => setF({ ...f, [fd.k]: e.target.value })} />
+          ) : (
+            <input
+              className={"input" + (["number", "date"].includes(fd.type) ? " mono" : "")}
+              type={fd.type || "text"}
+              placeholder={fd.placeholder || ""}
+              value={f[fd.k] ?? ""}
+              onChange={(e) => setF({ ...f, [fd.k]: e.target.value })}
+            />
+          )}
+        </Field>
+      ))}
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" onClick={submit}>Save</button>
+    </>
+  );
+}
+
+/* ============================================================
+   SMALL PIECES
+   ============================================================ */
+function useMoney(settings) {
+  const sym = CURRENCIES.find((c) => c.code === settings.currency)?.symbol || "";
+  return (v) =>
+    sym + num(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+const Field = ({ label, children }) => (
+  <label className="field"><span className="lbl">{label}</span>{children}</label>
+);
+
+const Stat = ({ label, value, sub, tone = "ink" }) => (
+  <div className={"stat " + tone}>
+    <div className="stat-label">{label}</div>
+    <div className="stat-value mono">{value}</div>
+    <div className="stat-sub">{sub}</div>
+  </div>
+);
+
+const Card = ({ title, sub, children }) => (
+  <div className="panel">
+    <div className="panel-head"><h3 className="h3">{title}</h3><span className="quiet">{sub}</span></div>
+    <div className="pad-tight">{children}</div>
+  </div>
+);
+
+const Empty = ({ title, body, action }) => (
+  <div className="empty">
+    <div className="empty-mark">◫</div>
+    <h3 className="h3">{title}</h3>
+    <p className="quiet">{body}</p>
+    {action}
+  </div>
+);
+
+function Modal({ title, children, onClose, wide }) {
+  useEffect(() => {
+    const esc = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [onClose]);
+  return (
+    <div className="modal-wrap" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className={"modal" + (wide ? " wide" : "")}>
+        <div className="modal-head">
+          <h3 className="h3">{title}</h3>
+          <button className="iconbtn" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   STYLE
+   ============================================================ */
+function Style() {
+  return (
+    <style>{`
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root{
+  --ink:#171D24; --ink-2:#212A33; --ink-3:#2E3843;
+  --paper:#F0EFEA; --card:#FFFFFF; --line:#E0DED5;
+  --text:#1E252B; --muted:#71797F;
+  --brass:#B0812A; --brass-soft:#F5E9CC;
+  --moss:#3D6B51; --moss-soft:#DFEAE2;
+  --rust:#A63E28; --rust-soft:#F6DFD8;
+  --blue:#38566E; --blue-soft:#DCE5EC;
+  --grey-soft:#E6E5DE;
+  --r:4px;
+}
+*{box-sizing:border-box}
+.app,.gate{font-family:'Archivo',system-ui,sans-serif;color:var(--text);-webkit-font-smoothing:antialiased}
+.mono{font-family:'IBM Plex Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.app{display:flex;min-height:100vh;background:var(--paper)}
+
+/* rail */
+.rail{width:238px;flex:0 0 238px;background:var(--ink);color:#C7CDD3;padding:20px 12px;display:flex;flex-direction:column;gap:22px;position:sticky;top:0;height:100vh;overflow-y:auto}
+.brand{display:flex;gap:11px;align-items:center;padding:0 6px}
+.brand-plate{width:36px;height:36px;flex:0 0 36px;border-radius:2px;background:linear-gradient(150deg,#D9AE4E,#9A6F1F);color:#241A05;font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:13px;display:grid;place-items:center;letter-spacing:.5px}
+.brand-name{font-weight:700;color:#F2F3F4;font-size:14px;line-height:1.2}
+.brand-sub{font-size:11.5px;color:#7D858D}
+.navgroup{margin-bottom:14px}
+.navgroup-label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#666E76;padding:0 8px 7px;font-weight:600}
+.navitem{display:flex;align-items:center;gap:10px;width:100%;background:none;border:0;color:#B6BCC2;padding:8px 8px;font:inherit;font-size:13.5px;text-align:left;cursor:pointer;border-radius:var(--r);border-left:2px solid transparent}
+.navitem:hover{background:var(--ink-2);color:#EDEFF1}
+.navitem.active{background:var(--ink-3);color:#fff;border-left-color:var(--brass);font-weight:600}
+.navicon{opacity:.55;width:14px;font-size:12px}
+.scrim{display:none}
+
+/* main */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:14px;padding:18px 30px;border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:5}
+.topbar>div:nth-child(1){flex:1}
+.topbar .iconbtn+div{flex:1}
+.eyebrow{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.page-title{font-size:19px;font-weight:700;margin:1px 0 0;letter-spacing:-.01em}
+.content{padding:26px 30px 60px;max-width:1180px;width:100%}
+
+/* type */
+.h2{font-size:16px;font-weight:700;margin:0}
+.h3{font-size:13.5px;font-weight:700;margin:0;letter-spacing:-.005em}
+.sub{margin:3px 0 0;font-size:12.5px;color:var(--muted)}
+.quiet{color:var(--muted);font-size:12.5px}
+.small{font-size:11.5px}
+.strong{font-weight:600}
+.r{text-align:right}
+.nowrap{white-space:nowrap}
+.moss-text{color:var(--moss)} .rust-text{color:var(--rust)}
+.lbl{display:block;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:600;margin-bottom:5px}
+
+.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:4px 0 16px;flex-wrap:wrap}
+
+/* stats */
+.statrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:26px}
+.stat{background:var(--card);border:1px solid var(--line);border-top:2px solid var(--ink);border-radius:var(--r);padding:14px 15px}
+.stat.moss{border-top-color:var(--moss)} .stat.rust{border-top-color:var(--rust)} .stat.grey{border-top-color:var(--line)}
+.stat-label{font-size:10px;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.stat-value{font-size:22px;font-weight:600;margin:7px 0 3px;letter-spacing:-.02em}
+.stat-sub{font-size:11.5px;color:var(--muted)}
+
+/* the board */
+.legend{display:flex;gap:16px;font-size:11.5px;color:var(--muted);margin-bottom:16px;flex-wrap:wrap}
+.legend.pad{padding:12px 16px 4px;margin:0}
+.legend span{display:flex;align-items:center;gap:6px}
+.pip{width:8px;height:8px;border-radius:1px;display:inline-block}
+.pip.moss{background:var(--moss)} .pip.brass{background:var(--brass)} .pip.rust{background:var(--rust)} .pip.grey{background:#B9B7AC} .pip.blue{background:var(--blue)}
+
+.board-group{margin-bottom:24px}
+.board-title{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;padding-bottom:7px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px}
+.board-meta{font-weight:400;font-size:11.5px;color:var(--muted)}
+.board{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.door{position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:13px 13px 11px 17px;cursor:pointer;text-align:left;font:inherit;transition:transform .12s ease,box-shadow .12s ease}
+.door:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(23,29,36,.09)}
+.door-edge{position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:var(--r) 0 0 var(--r)}
+.door.current .door-edge{background:var(--moss)}
+.door.due .door-edge{background:var(--brass)}
+.door.overdue .door-edge{background:var(--rust)}
+.door.vacant .door-edge{background:#C4C2B7}
+.door.vacant{background:repeating-linear-gradient(135deg,#FBFBF9,#FBFBF9 6px,#F4F3EF 6px,#F4F3EF 12px)}
+.door-no{font-family:'IBM Plex Mono',monospace;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--ink)}
+.door-tenant{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.door.vacant .door-tenant{color:var(--muted);font-weight:400}
+.door-foot{display:flex;justify-content:space-between;align-items:baseline;width:100%;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);gap:6px}
+.door-rent{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}
+.door-state{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}
+.door.current .door-state{color:var(--moss)} .door.due .door-state{color:var(--brass)}
+.door.overdue .door-state{color:var(--rust)} .door.vacant .door-state{color:var(--muted)}
+.empty-door{cursor:default;color:var(--muted);font-size:12px;justify-content:center;align-items:center;grid-column:1/-1}
+
+/* panels + tables */
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);margin-bottom:18px;overflow:hidden}
+.panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.pad{padding:16px}
+.pad-tight{padding:6px 16px 12px}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+
+.table{width:100%;border-collapse:collapse;font-size:13px}
+.table th{text-align:left;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:600;padding:9px 16px;border-bottom:1px solid var(--line);background:#FAFAF8}
+.table th.r{text-align:right}
+.table td{padding:11px 16px;border-bottom:1px solid #F0EFE9;vertical-align:middle}
+.table tbody tr:last-child td{border-bottom:0}
+.table tbody tr:hover{background:#FBFBF9}
+
+.list{list-style:none;margin:0;padding:0}
+.list li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #F0EFE9;font-size:13px}
+.list li:last-child{border-bottom:0}
+
+.log{list-style:none;margin:0;padding:0}
+.log li{display:grid;grid-template-columns:74px 1fr auto;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid #F0EFE9;font-size:13px}
+.log li:last-child{border-bottom:0}
+.log-msg{min-width:0}
+
+/* chips */
+.chip{display:inline-block;font-size:10px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;padding:3px 7px;border-radius:2px;white-space:nowrap}
+.chip.moss{background:var(--moss-soft);color:#2C4E3B}
+.chip.rust{background:var(--rust-soft);color:#7E2E1D}
+.chip.brass{background:var(--brass-soft);color:#725218}
+.chip.blue{background:var(--blue-soft);color:#2A4155}
+.chip.grey{background:var(--grey-soft);color:#5E6167}
+
+/* buttons */
+.btn{font:inherit;font-size:12.5px;font-weight:600;padding:8px 14px;border-radius:var(--r);border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;transition:background .12s,border-color .12s}
+.btn:hover{background:#F6F5F2;border-color:#CFCCC1}
+.btn.primary{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.primary:hover{background:var(--ink-3)}
+.btn.ghost{background:transparent}
+.btn.danger{color:var(--rust);border-color:var(--rust-soft)}
+.btn.danger:hover{background:var(--rust-soft)}
+.btn.primary.danger,.btn.danger:not(.tiny):not(.small){}
+.btn.small{padding:6px 11px;font-size:11.5px}
+.btn.tiny{padding:4px 8px;font-size:11px;margin-left:4px}
+.btn.block{width:100%;margin-top:14px;padding:11px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btnrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btnrow.r{justify-content:flex-end;margin-top:16px}
+.iconbtn{background:none;border:0;font-size:19px;line-height:1;color:var(--muted);cursor:pointer;padding:4px 8px;border-radius:var(--r)}
+.iconbtn:hover{background:var(--grey-soft)}
+.only-mobile{display:none}
+.btn.file{position:relative;overflow:hidden}
+.btn.file input{position:absolute;inset:0;opacity:0;cursor:pointer}
+
+.tabs{display:flex;gap:2px;margin-bottom:16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tab{font:inherit;font-size:12.5px;font-weight:600;background:none;border:0;border-bottom:2px solid transparent;padding:8px 12px;color:var(--muted);cursor:pointer;margin-bottom:-1px}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--ink);border-bottom-color:var(--brass)}
+
+/* forms */
+.field{display:block;margin-bottom:13px}
+.input{width:100%;font:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r);background:#FCFCFB;color:var(--text)}
+.input:focus{outline:2px solid var(--brass);outline-offset:-1px;border-color:var(--brass);background:#fff}
+textarea.input{resize:vertical}
+.input.center{text-align:center;letter-spacing:.3em;font-size:16px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.check{display:flex;align-items:center;gap:8px;font-size:12.5px;margin:6px 0 14px;cursor:pointer}
+.err{background:var(--rust-soft);color:#7E2E1D;font-size:12.5px;padding:8px 11px;border-radius:var(--r);margin:8px 0;font-weight:500}
+
+.items{display:flex;flex-direction:column;gap:7px;margin-bottom:9px}
+.item-row{display:grid;grid-template-columns:1fr 70px 100px 92px 30px;gap:7px;align-items:center}
+.item-amt{font-size:12.5px;text-align:right;color:var(--muted)}
+
+.form-totals,.doc-totals,.balance-note{margin-top:16px;border-top:1px solid var(--line);padding-top:11px;font-size:13px}
+.form-totals div,.doc-totals div,.balance-note div{display:flex;justify-content:space-between;padding:4px 0}
+.form-totals .grand,.doc-totals .grand,.balance-note .grand{border-top:1px solid var(--line);margin-top:5px;padding-top:8px;font-weight:700;font-size:15px}
+.balance-note{margin-top:0;border-top:0;border-bottom:1px solid var(--line);padding-bottom:11px;margin-bottom:15px}
+.balance-note .lbl{margin:0}
+
+/* modal */
+.modal-wrap{position:fixed;inset:0;background:rgba(23,29,36,.42);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto;z-index:50}
+.modal{background:var(--card);border-radius:var(--r);width:100%;max-width:470px;box-shadow:0 22px 60px rgba(23,29,36,.28);animation:rise .16s ease}
+.modal.wide{max-width:680px}
+@keyframes rise{from{transform:translateY(10px);opacity:0}to{transform:none;opacity:1}}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}
+.modal-body{padding:18px}
+
+/* documents */
+.doc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding-bottom:16px;border-bottom:2px solid var(--ink);margin-bottom:16px}
+.doc-biz{font-size:16px;font-weight:800;letter-spacing:-.01em}
+.doc-kind{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.doc-no{font-size:17px;font-weight:600;color:var(--brass)}
+.doc-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:14px;margin-bottom:18px;font-size:13px}
+.doc-table{border:1px solid var(--line);border-radius:var(--r)}
+.doc-notes{margin-top:16px;background:#FAFAF8;border-left:2px solid var(--brass);padding:10px 12px;font-size:12.5px}
+.receipt-amount{background:var(--moss-soft);border-radius:var(--r);padding:16px;text-align:center;margin-bottom:18px}
+.receipt-amount .big{font-size:30px;font-weight:600;color:#2C4E3B;letter-spacing:-.02em}
+.receipt-sig{margin-top:26px;text-align:right}
+.sig-line{border-bottom:1px solid var(--ink);width:190px;margin:0 0 5px auto}
+
+/* chart */
+.chart{display:flex;gap:14px;align-items:flex-end;height:180px;padding:20px 16px 0}
+.chart-col{flex:1;display:flex;flex-direction:column;align-items:center;height:100%}
+.bars{display:flex;gap:3px;align-items:flex-end;height:100%;width:100%;justify-content:center}
+.bar{width:14px;min-height:2px;border-radius:1px 1px 0 0}
+.bar.billed{background:var(--blue)} .bar.collected{background:var(--moss)} .bar.spent{background:var(--rust)}
+.chart-label{font-size:10.5px;color:var(--muted);padding-top:8px;font-weight:600}
+.meter{height:6px;background:var(--grey-soft);border-radius:3px;overflow:hidden;min-width:80px}
+.meter div{height:100%;background:var(--brass)}
+
+/* empty */
+.empty{text-align:center;padding:52px 20px;background:var(--card);border:1px dashed var(--line);border-radius:var(--r);margin-bottom:18px}
+.empty-mark{font-size:26px;color:#C9C7BC;margin-bottom:10px}
+.empty .quiet{margin:5px 0 16px}
+.danger-panel{border-color:var(--rust-soft)}
+.danger-confirm p{font-size:12.5px;color:var(--muted);margin:0 0 12px;max-width:520px}
+
+/* gate */
+.gate{min-height:100vh;display:grid;place-items:center;background:var(--ink);padding:20px}
+.gate-card{background:var(--card);border-radius:6px;padding:32px;width:100%;max-width:360px;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.35)}
+.gate-card.wide{max-width:460px;text-align:left}
+.gate-plate{width:44px;height:44px;border-radius:2px;background:linear-gradient(150deg,#D9AE4E,#9A6F1F);color:#241A05;font-family:'IBM Plex Mono',monospace;font-weight:600;display:grid;place-items:center;margin:0 0 16px;letter-spacing:.5px}
+.gate-card:not(.wide) .gate-plate{margin:0 auto 16px}
+.gate-title{font-size:18px;font-weight:700;margin:0}
+.gate-sub{font-size:12.5px;color:var(--muted);margin:5px 0 20px}
+.loading{color:var(--muted);font-size:13px}
+
+/* toast */
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;font-size:12.5px;font-weight:500;padding:10px 18px;border-radius:var(--r);box-shadow:0 10px 30px rgba(0,0,0,.25);z-index:80;animation:rise .18s ease}
+
+@media (max-width:900px){
+  .split,.row2,.row3{grid-template-columns:1fr}
+  .item-row{grid-template-columns:1fr 56px 80px 70px 28px;gap:5px}
+  .rail{position:fixed;left:0;top:0;bottom:0;transform:translateX(-100%);transition:transform .2s ease;z-index:60}
+  .rail.open{transform:none}
+  .scrim{display:block;position:fixed;inset:0;background:rgba(23,29,36,.42);z-index:55}
+  .only-mobile{display:block}
+  .content,.topbar{padding-left:16px;padding-right:16px}
+  .table{font-size:12px}
+  .table th,.table td{padding:8px 10px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media print{
+  .rail,.topbar,.modal-head,.btnrow,.btn{display:none!important}
+  .modal-wrap{position:static;background:none;padding:0}
+  .modal{box-shadow:none;max-width:100%}
+  .app{background:#fff}
+}
+`}</style>
+  );
 }
